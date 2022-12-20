@@ -1,0 +1,125 @@
+# These are the commands used to perform the RRHP analysis on the manuscript entitled:
+# Genome-wide hydroxymethylation profiles in liver of female Nile tilapia with distinct growth performance"
+
+
+# DISCLAIMER: 
+# Paths to filenames are indicative and can differ from environment to environment
+# The authors have selected filtering options and values that are specific to the dataset associated to the manuscript above
+# Adjustments are necessary for public use
+# The included commands and scripts are licensed under a General Public License - GNU GPLv3 #
+
+#Trimming
+trim_galore --phred33 --rrbs --fastqc -a 'GATCGGAAGAGC' -o ~/tilapia/trimmed SAMPLE.fastq
+
+#Alignment
+bowtie --chunkmbs 1000 -S -v 1 -n 1 -m 3 --strata --best -p 6  ~/tilapia/bowtie/index/oniloticus ~/tilapia/trimmed/file.fq ~/tilapia/bowtie/sam/file.sam &
+
+#CCGG pattern localization (python script) # Execute "get_ccgg_positions.py" #
+#place the python script in the directory with the aligned files
+
+ls -l *.sam > list_of_sam_files
+python get_ccgg_positions.py
+
+#output goes to R - count column and aggregate (see below) or else -->
+
+# extract CCGG coordinated with grep per strand
+grep -e "CCGG[^CGTAN]" file_neg.sam | cut -f 2,3,4,5 > ~/path/to/file_neg.txt &
+grep -e "[^CGTAN]CCGG" file_pos.sam | cut -f 2,3,4 > ~/path/to/file_pos.txt &
+
+#Concatenate files and input in R following the "ReadAlignment" function
+
+#in R
+
+# Creating the "ReadAlignmentFile" function #
+ReadAlignmentFile <- function(fileName) {
+  matrix <- read.table(file = fileName, header = FALSE, sep = "")
+  colnames(matrix) <- c("Chromosome", "Start", "Strand")
+  return(matrix[!matrix$Chromosome %in% "*",])
+}
+
+# Import all the files after isolating all reads that start with CCGG from both strands #
+# Each read per sample is designated by three columns: Chromosome, Start, Strand
+objectx <- ReadAlignmentFile("file.txt")
+
+# Creating a column that identifies each read as a single read #
+objectx$Count <- 1
+# Sum the number of reads that occur multiple times #
+objectxCounts <- aggregate(objectx$Count, list(Chromosome = objectx$Chromosome, Start = objectx$Start, Strand = objectx$Strand), "sum")
+
+# Concatenating all samples into one matrix #
+CHCounts <- Reduce(function(...) merge(...,by=c("Chromosome","Start","Strand"),all=TRUE),list(objectxCounts, objectyCounts, objectzCounts))
+
+# Exporting the file in a txt file #
+write.table(CHCounts, "CHCounts.txt", quote=F, row.names=F, sep="\t")
+
+# Continue filtering in a new R session #
+# Required packages #
+library(limma)
+library(ggplot2)
+library(reshape2)
+
+# Importing the concatenated matrix into R #
+CH <- read.table("CHCounts.txt", header=T)
+
+# Replace “NA” values with 0 #
+CH[(is.na(CH))] <- 0
+
+# Coping chromosome, position (start) and strand information as row names #
+rownames(CH) <- paste(CH[,1], CH[,2], CH[,3], sep=";")
+
+# First filter (removal of positions when more than 6 samples have 0 value) #
+CHsub <- CH[apply(CH[,4:15] > 0, 1, sum) >= 6, 4:15]
+
+# Calculate the median of the data set #
+mean_se(apply(CHsub[,1:12], 1, median))
+#M = data_median
+
+# Second filter (removal of positions when more than 6 samples have less than M counts) #
+CHsub.M <- CHsub[apply(CHsub[,1:12] >= M, 1, sum) >= 6, 1:12]
+
+# Voom transformation #
+CHvoom <- voom(CHsub.M, plot=F)
+
+# Creating the appropriate factors that describe our samples and groups #
+samples <- factor(sub("^(.).*", "\\1", colnames(CHvoom)))
+
+# Creating the design #
+des <- model.matrix(~ 0 + samples)
+
+# Correcting column names #
+colnames(des) <- c("C", "H")
+
+# Creating the contrast matrix #
+contrast.matrix <- makeContrasts(CvsH = C - H, levels=des)
+
+# Fitting the linear models in limma with the duplicate correlation #
+fit <- lmFit(CHnorm.26.lcms, des)
+
+# Adding the contrast matrix within the model #
+fit2 <- contrasts.fit(fit, contrast.matrix)
+
+# Empirical Bayes smoothing of standard errors #
+fit2 <- eBayes(fit2)
+
+# Returning results of the comparison into an object #
+top <- topTable(fit2, coef="DvsW", n=Inf)
+
+# Isolation of all the positions with an adjusted p value under 0.05 and non zero values. #
+top.p <- top[top$adj.P.Val <=0.05 & top$adj.P.Val!=0, ]
+
+# Annotation of DhmCs on the reference genome
+
+# Rearrange the columns of "top.p" object from above in R, and create a BED or TXT file following HOMER instructions found below:
+# http://homer.ucsd.edu/homer/ngs/annotation.html
+
+# BED files should have at minimum 6 columns (separated by TABs, additional columns will be ignored)
+# Column1: chromosome
+# Column2: starting position
+# Column3: ending position
+# Column4: Unique Peak ID
+# Column5: not used
+# Column6: Strand (+/- or 0/1, where 0="+", 1="-")
+
+annotatePeaks.pl /path-to-limma-output/top.p.txt /path-to-reference-genome/reference_genome.fna -gtf /path-to-reference-annotation/annotation_file.gtf > output.txt
+
+# If the annotation file is in gff or gff3 format, replace the file respectively following the instructions on HOMER website provided above
